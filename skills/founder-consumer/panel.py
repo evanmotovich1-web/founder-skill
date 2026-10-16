@@ -52,8 +52,11 @@ class PanelError(Exception):
 # ── dealing ─────────────────────────────────────────────────────────────────────
 def _quota(items, n, key="share"):
     """Split n across items by their shares, exactly (largest remainder)."""
-    total = sum(float(it.get(key, 1)) for it in items) or 1.0
-    raw = [n * float(it.get(key, 1)) / total for it in items]
+    shares = [float(it.get(key, 1)) for it in items]
+    if any(s < 0 for s in shares) or sum(shares) <= 0:
+        raise PanelError("every %s must be 0 or more, and they must add up to more than 0" % key)
+    total = sum(shares)
+    raw = [n * s / total for s in shares]
     counts = [int(r) for r in raw]
     order = sorted(range(len(items)), key=lambda i: raw[i] - counts[i], reverse=True)
     for i in order[: n - sum(counts)]:
@@ -143,8 +146,18 @@ def init(d, customer_path, pitch_path, n=100, seed=None):
         raise PanelError("the pitch is empty")
     if seed is None:
         seed = random.SystemRandom().randrange(1, 10 ** 6)
+    panel = {"n": n, "seed": seed, "customer": customer, "pitch": pitch}
+    answers = _path(d, "answers")
+    if os.path.isdir(answers) and any(f.endswith(".json") for f in os.listdir(answers)):
+        try:
+            old = _read_json(_path(d, "panel.json"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            old = None
+        if old != panel:
+            raise PanelError("%s already holds answers from a different panel; they would be counted against the new"
+                             " buyers. Use a new --dir, or move %s away first" % (d, answers))
     cards = deal(customer, n, seed)
-    _write_json(_path(d, "panel.json"), {"n": n, "seed": seed, "customer": customer, "pitch": pitch})
+    _write_json(_path(d, "panel.json"), panel)
     _write_json(_path(d, "personas.json"), cards)
     os.makedirs(_path(d, "briefs"), exist_ok=True)
     os.makedirs(_path(d, "answers"), exist_ok=True)
@@ -217,6 +230,13 @@ def _answer_ok(path, pid):
         a = _read_json(path)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return "not valid JSON"
+    return _answer_problem(a, pid)
+
+
+def _answer_problem(a, pid):
+    """None if the parsed answer is good, else a short problem string."""
+    if not isinstance(a, dict):
+        return "not a JSON object"
     missing = ANSWER_FIELDS - set(a)
     if missing:
         return "missing " + ", ".join(sorted(missing))
@@ -226,6 +246,8 @@ def _answer_ok(path, pid):
         return "'buys' must be true or false"
     if a.get("reason_code") not in REASONS:
         return "reason_code %r is not one of %s" % (a.get("reason_code"), ", ".join(REASONS))
+    if not isinstance(a.get("reason"), str):
+        return "'reason' must be text"
     return None
 
 
@@ -241,12 +263,11 @@ def save(d, pid, text):
         obj, _ = json.JSONDecoder().raw_decode(text[start:])
     except json.JSONDecodeError as e:
         raise PanelError("the reply's JSON does not parse: %s" % e)
+    prob = _answer_problem(obj, pid)
+    if prob:
+        raise PanelError("%s's answer is not valid (%s); re-run its brief instead" % (pid, prob))
     path = _path(d, "answers", pid + ".json")
     _write_json(path, obj)
-    prob = _answer_ok(path, pid)
-    if prob:
-        os.remove(path)
-        raise PanelError("%s's answer is not valid (%s); re-run its brief instead" % (pid, prob))
     return path
 
 
